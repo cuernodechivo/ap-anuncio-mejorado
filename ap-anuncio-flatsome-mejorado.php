@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Anuncio entre productos Audio Pro
  * Description: Inserta varias imagenes publicitarias entre productos. Compatible con Flatsome, categorias y taxonomias de marca.
- * Version: 1.12.0
+ * Version: 1.12.1
  * Author: Audio Pro
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -13,6 +13,18 @@
  */
 
 if (!defined('ABSPATH')) exit;
+
+define('AP_ANUNCIO_FLATSOME_VERSION', '1.12.1');
+
+// El plugin no toca pedidos: declarar compatibilidad con HPOS para que
+// WooCommerce no lo marque como "compatibilidad desconocida".
+add_action('before_woocommerce_init', 'ap_anuncio_flatsome_declare_wc_compat');
+
+function ap_anuncio_flatsome_declare_wc_compat() {
+    if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+    }
+}
 
 add_action('plugins_loaded', 'ap_anuncio_flatsome_bootstrap');
 
@@ -98,6 +110,12 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
 
     private $loop_skip_rows = null;
 
+    // Indice del siguiente anuncio pendiente dentro de $loop_ads (ya ordenados por posicion).
+    private $next_ad_index = 0;
+
+    // Indica que estamos dentro del loop principal de la tienda.
+    private $in_main_loop = false;
+
     private $default_grid_columns = 4;
 
     private $brand_taxonomies = [
@@ -129,6 +147,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         add_action('woocommerce_before_shop_loop', [$this, 'reset_count'], 1);
         add_action('woocommerce_shop_loop', [$this, 'show_ad'], 1);
         add_action('woocommerce_shop_loop', [$this, 'count_product'], 999);
+        add_filter('woocommerce_product_loop_end', [$this, 'append_trailing_ads'], 1);
 
         add_action('wp_enqueue_scripts', [$this, 'styles']);
     }
@@ -282,7 +301,10 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 $row = max(1, (int) ceil($position / $grid_columns));
                 $column = (($position - 1) % $grid_columns) + 1;
             } else {
-                $row = $this->sanitize_positive_int($index + 1);
+                // Sin fila/columna ni posicion: colocar en la ultima columna de la
+                // siguiente fila libre. count() evita un TypeError en PHP 8 si la
+                // clave del array no fuese numerica.
+                $row = count($sanitized) + 1;
                 $column = $grid_columns;
                 $position = (($row - 1) * $grid_columns) + $column;
             }
@@ -310,6 +332,8 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         $this->ads_rendered = 0;
         $this->loop_ads = null;
         $this->loop_skip_rows = null;
+        $this->next_ad_index = 0;
+        $this->in_main_loop = true;
     }
 
     public function count_product() {
@@ -328,20 +352,54 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             $this->loop_skip_rows = $this->get_skip_rows_for_current_page();
         }
 
-        foreach ($this->loop_ads as $ad) {
+        $total_ads = count($this->loop_ads);
+
+        // Los anuncios vienen ordenados por posicion, asi que solo hace falta
+        // mirar el siguiente pendiente. Si dos anuncios comparten celda, el
+        // segundo se muestra en la celda inmediatamente posterior en vez de
+        // perderse.
+        while ($this->next_ad_index < $total_ads) {
+            $ad = $this->loop_ads[$this->next_ad_index];
+
             if (!empty($ad['row']) && in_array(absint($ad['row']), $this->loop_skip_rows, true)) {
+                $this->next_ad_index++;
                 continue;
             }
 
             $next_cell = $this->count + $this->ads_rendered + 1;
 
-            if ($next_cell !== intval($ad['position'])) {
-                continue;
+            if (intval($ad['position']) > $next_cell) {
+                break;
             }
 
             $this->render_frontend_ad($ad);
             $this->ads_rendered++;
+            $this->next_ad_index++;
         }
+    }
+
+    /**
+     * Muestra los anuncios que quedan justo despues del ultimo producto de la
+     * pagina (por ejemplo, un anuncio en fila 1 columna 4 en una categoria con
+     * solo 3 productos). Antes esos anuncios nunca se renderizaban porque el
+     * hook woocommerce_shop_loop solo se ejecuta antes de cada producto.
+     */
+    public function append_trailing_ads($loop_end_html) {
+        if (!$this->in_main_loop) {
+            return $loop_end_html;
+        }
+
+        $this->in_main_loop = false;
+
+        if (!$this->is_valid_page()) {
+            return $loop_end_html;
+        }
+
+        ob_start();
+        $this->show_ad();
+        $trailing = ob_get_clean();
+
+        return $trailing . $loop_end_html;
     }
 
     private function render_frontend_ad($ad) {
@@ -370,7 +428,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             echo '<div class="col-inner">';
                 echo '<div class="box box-normal">';
                     echo '<div class="box-image">';
-                        if ($link) echo '<a href="' . esc_url($link) . '" rel="sponsored noopener">';
+                        if ($link) echo '<a href="' . $link . '" rel="sponsored noopener">';
                         echo wp_kses_post($image_html);
                         if ($link) echo '</a>';
                     echo '</div>';
@@ -560,7 +618,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
     public function styles() {
         if (!$this->is_valid_page()) return;
 
-        wp_register_style('ap-flatsome-ad-style', false, [], '1.9.2');
+        wp_register_style('ap-flatsome-ad-style', false, [], AP_ANUNCIO_FLATSOME_VERSION);
         wp_enqueue_style('ap-flatsome-ad-style');
 
         $fallback_width = 100 / $this->get_grid_columns();
@@ -818,9 +876,13 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         }
 
         wp_enqueue_media();
-        wp_enqueue_script('jquery');
 
-        wp_add_inline_script('jquery', <<<'JS'
+        // Handle propio con dependencia de jquery y media-editor: garantiza que
+        // wp.media y jQuery esten cargados antes de nuestro script.
+        wp_register_script('ap-anuncio-admin', false, ['jquery', 'media-editor'], AP_ANUNCIO_FLATSOME_VERSION, true);
+        wp_enqueue_script('ap-anuncio-admin');
+
+        wp_add_inline_script('ap-anuncio-admin', <<<'JS'
             jQuery(document).ready(function($) {
                 let frame;
 
