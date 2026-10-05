@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Anuncio entre productos Audio Pro
- * Description: Inserta varias imagenes publicitarias entre productos. Compatible con Flatsome, categorias y taxonomias de marca.
- * Version: 1.13.0
+ * Description: Inserta imagenes, videos y Shorts de YouTube publicitarios entre productos. Compatible con Flatsome, categorias y taxonomias de marca.
+ * Version: 1.14.0
  * Author: Audio Pro
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -14,7 +14,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('AP_ANUNCIO_FLATSOME_VERSION', '1.13.0');
+define('AP_ANUNCIO_FLATSOME_VERSION', '1.14.0');
 define('AP_ANUNCIO_FLATSOME_FILE', __FILE__);
 
 // El plugin no toca pedidos: declarar compatibilidad con HPOS para que
@@ -106,6 +106,11 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
 
     // Que anuncios usa una categoria o marca.
     const TERM_MODES = ['global', 'custom', 'none'];
+
+    // Tipos de anuncio y formas (proporciones) disponibles para video.
+    const AD_TYPES = ['image', 'video', 'youtube'];
+
+    const AD_FORMATS = ['auto', 'product', 'vertical', 'horizontal'];
 
     private $count = 0;
 
@@ -305,11 +310,22 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 continue;
             }
 
+            // Los anuncios guardados antes de la version 1.14 no tienen tipo: son imagenes.
+            $type = (isset($ad['type']) && in_array($ad['type'], self::AD_TYPES, true)) ? $ad['type'] : 'image';
             $image_id = isset($ad['image_id']) ? absint($ad['image_id']) : 0;
-            if (!$image_id) {
+            $video_id = isset($ad['video_id']) ? absint($ad['video_id']) : 0;
+            $youtube = $this->parse_youtube(isset($ad['youtube_url']) ? $ad['youtube_url'] : '');
+
+            $has_media = ('image' === $type && $image_id)
+                || ('video' === $type && $video_id)
+                || ('youtube' === $type && $youtube['id']);
+
+            if (!$has_media) {
                 continue;
             }
 
+            $format = (isset($ad['format']) && in_array($ad['format'], self::AD_FORMATS, true)) ? $ad['format'] : $this->get_default_format($type);
+            $button_text = (isset($ad['button_text']) && is_scalar($ad['button_text'])) ? $this->limit_text(sanitize_text_field((string) $ad['button_text']), 40) : '';
             $link = isset($ad['link']) ? $this->sanitize_ad_link($ad['link']) : '';
             $row = (isset($ad['row']) && is_scalar($ad['row'])) ? $this->sanitize_positive_int($ad['row']) : 0;
             $column = (isset($ad['column']) && is_scalar($ad['column'])) ? $this->sanitize_positive_int($ad['column']) : 0;
@@ -332,7 +348,13 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             }
 
             $sanitized[] = [
+                'type' => $type,
                 'image_id' => $image_id,
+                'video_id' => $video_id,
+                'youtube_id' => $youtube['id'],
+                'youtube_url' => $youtube['url'],
+                'format' => $format,
+                'button_text' => $button_text,
                 'link' => $link,
                 'row' => $row,
                 'column' => $column,
@@ -347,6 +369,62 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         });
 
         return array_values($sanitized);
+    }
+
+    /**
+     * Extrae el ID de un enlace de YouTube: Shorts, watch?v=, youtu.be, embed o
+     * live. Tambien acepta el ID suelto de 11 caracteres.
+     */
+    public function parse_youtube($value) {
+        $empty = ['id' => '', 'url' => '', 'short' => false];
+
+        if (!is_scalar($value)) {
+            return $empty;
+        }
+
+        $value = trim((string) $value);
+        if ('' === $value) {
+            return $empty;
+        }
+
+        $id = '';
+        $short = false;
+        $patterns = [
+            '~youtube(?:-nocookie)?\.com/shorts/([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])~i' => true,
+            '~youtu\.be/([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])~i' => false,
+            '~youtube(?:-nocookie)?\.com/(?:embed|live|v)/([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])~i' => false,
+            '~youtube\.com/.*[?&]v=([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])~i' => false,
+        ];
+
+        if (preg_match('~^[A-Za-z0-9_-]{11}$~', $value)) {
+            $id = $value;
+        } else {
+            foreach ($patterns as $pattern => $is_short) {
+                if (preg_match($pattern, $value, $matches)) {
+                    $id = $matches[1];
+                    $short = $is_short;
+                    break;
+                }
+            }
+        }
+
+        if ('' === $id) {
+            return $empty;
+        }
+
+        return [
+            'id' => $id,
+            'short' => $short,
+            'url' => $short ? 'https://www.youtube.com/shorts/' . $id : 'https://www.youtube.com/watch?v=' . $id,
+        ];
+    }
+
+    private function get_default_format($type) {
+        return 'video' === $type ? 'product' : 'auto';
+    }
+
+    private function limit_text($text, $length) {
+        return function_exists('mb_substr') ? mb_substr($text, 0, $length) : substr($text, 0, $length);
     }
 
     /* ---------------------------------------------------------------------
@@ -398,8 +476,11 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 break;
             }
 
-            $this->render_frontend_ad($ad);
-            $this->ads_rendered++;
+            // Si el archivo ya no existe no se muestra nada y la casilla queda para un producto.
+            if ($this->render_frontend_ad($ad)) {
+                $this->ads_rendered++;
+            }
+
             $this->next_ad_index++;
         }
     }
@@ -427,12 +508,51 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         return $trailing . $loop_end_html;
     }
 
+    /**
+     * Imprime el anuncio dentro de la grilla. Devuelve false si no habia nada
+     * que mostrar (por ejemplo, si el archivo se borro de la biblioteca).
+     */
     private function render_frontend_ad($ad) {
-        if (empty($ad['image_id'])) {
-            return;
+        $type = (isset($ad['type']) && in_array($ad['type'], self::AD_TYPES, true)) ? $ad['type'] : 'image';
+
+        if ('video' === $type) {
+            $media = $this->get_video_ad_html($ad);
+        } elseif ('youtube' === $type) {
+            $media = $this->get_youtube_ad_html($ad);
+        } else {
+            $media = $this->get_image_ad_html($ad);
         }
 
-        $image_id = absint($ad['image_id']);
+        if ('' === $media) {
+            return false;
+        }
+
+        $after = '';
+        if ('youtube' === $type && !empty($ad['link'])) {
+            $button_text = !empty($ad['button_text']) ? $ad['button_text'] : 'Ver oferta';
+            $after = '<div class="box-text text-center ap-ad-cta-wrap">'
+                . '<a class="button primary is-small ap-ad-cta" href="' . esc_url($ad['link']) . '" rel="sponsored noopener">' . esc_html($button_text) . '</a>'
+                . '</div>';
+        }
+
+        echo '<div class="product-small col has-hover ap-flatsome-ad ap-flatsome-ad--' . esc_attr($type) . '">';
+            echo '<div class="col-inner">';
+                echo '<div class="box box-normal">';
+                    echo '<div class="box-image">' . $media . '</div>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Escapado en get_*_ad_html().
+                    echo $after; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Escapado arriba.
+                echo '</div>';
+            echo '</div>';
+        echo '</div>';
+
+        return true;
+    }
+
+    private function get_image_ad_html($ad) {
+        $image_id = !empty($ad['image_id']) ? absint($ad['image_id']) : 0;
+        if (!$image_id) {
+            return '';
+        }
+
         $alt = trim((string) get_post_meta($image_id, '_wp_attachment_image_alt', true));
         if ('' === $alt) {
             $alt = 'Publicidad';
@@ -445,21 +565,182 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             'decoding' => 'async',
         ]);
 
-        if (!$image_html) return;
+        if (!$image_html) {
+            return '';
+        }
 
+        return $this->wrap_ad_link(wp_kses_post($image_html), $ad);
+    }
+
+    /**
+     * Video subido a la biblioteca: se reproduce solo, sin sonido y en bucle
+     * cuando entra en pantalla (lo controla assets/front.js).
+     */
+    private function get_video_ad_html($ad) {
+        $video_id = !empty($ad['video_id']) ? absint($ad['video_id']) : 0;
+        $video_url = $video_id ? wp_get_attachment_url($video_id) : '';
+
+        if (!$video_url) {
+            return '';
+        }
+
+        $mime = (string) get_post_mime_type($video_id);
+        if (0 !== strpos($mime, 'video/')) {
+            $mime = 'video/mp4';
+        }
+
+        $poster = !empty($ad['image_id']) ? wp_get_attachment_image_url(absint($ad['image_id']), 'large') : '';
+
+        $video = '<video class="ap-ad-video" muted loop playsinline preload="none" data-ap-autoplay aria-label="Publicidad"'
+            . ($poster ? ' poster="' . esc_url($poster) . '"' : '') . '>'
+            . '<source src="' . esc_url($video_url) . '" type="' . esc_attr($mime) . '">'
+            . '</video>';
+
+        $this->enqueue_front_script();
+
+        return $this->wrap_ad_link($this->get_media_box($video, $this->get_ad_ratio($ad), 'video'), $ad, 'Publicidad');
+    }
+
+    /**
+     * YouTube: se muestra la miniatura con un boton de reproducir y el
+     * reproductor solo se carga al tocarla, para no hacer lenta la tienda.
+     */
+    private function get_youtube_ad_html($ad) {
+        $youtube = $this->parse_youtube(isset($ad['youtube_url']) ? $ad['youtube_url'] : '');
+
+        if (!$youtube['id']) {
+            return '';
+        }
+
+        $ratio = $this->get_ad_ratio($ad);
+        $cover = !empty($ad['image_id']) ? wp_get_attachment_image_url(absint($ad['image_id']), 'large') : '';
+
+        if ($cover) {
+            $thumb = '<img class="ap-ad-youtube__thumb" src="' . esc_url($cover) . '" alt="" loading="lazy" decoding="async">';
+        } else {
+            // La miniatura de YouTube trae bandas negras: se amplia para recortarlas.
+            $scale = $this->get_youtube_thumb_scale($ratio, $youtube['short'] ? 9 / 16 : 16 / 9);
+            $thumb = '<img class="ap-ad-youtube__thumb" src="' . esc_url('https://i.ytimg.com/vi/' . $youtube['id'] . '/hqdefault.jpg') . '" alt="" loading="lazy" decoding="async"'
+                . ($scale > 1 ? ' style="transform:scale(' . esc_attr($this->css_number($scale)) . ')"' : '') . '>';
+        }
+
+        $icon = '<span class="ap-ad-youtube__icon" aria-hidden="true"><svg viewBox="0 0 68 48" width="68" height="48" focusable="false">'
+            . '<path d="M66.5 7.7a8.5 8.5 0 0 0-6-6C55.2.3 34 .3 34 .3s-21.2 0-26.5 1.4a8.5 8.5 0 0 0-6 6C.1 13 .1 24 .1 24s0 11 1.4 16.3a8.5 8.5 0 0 0 6 6C12.8 47.7 34 47.7 34 47.7s21.2 0 26.5-1.4a8.5 8.5 0 0 0 6-6C67.9 35 67.9 24 67.9 24s0-11-1.4-16.3z" fill="#f00"/>'
+            . '<path d="M45 24 27 14v20z" fill="#fff"/></svg></span>';
+
+        $play = '<a class="ap-ad-youtube__play" href="' . esc_url($youtube['url']) . '" target="_blank" rel="noopener" aria-label="Reproducir video">' . $thumb . $icon . '</a>';
+
+        $this->enqueue_front_script();
+
+        return $this->get_media_box($play, $ratio, 'youtube', ' data-ap-youtube="' . esc_attr($youtube['id']) . '"');
+    }
+
+    private function wrap_ad_link($html, $ad, $label = '') {
         $link = !empty($ad['link']) ? esc_url($ad['link']) : '';
 
-        echo '<div class="product-small col has-hover ap-flatsome-ad">';
-            echo '<div class="col-inner">';
-                echo '<div class="box box-normal">';
-                    echo '<div class="box-image">';
-                        if ($link) echo '<a href="' . $link . '" rel="sponsored noopener">';
-                        echo wp_kses_post($image_html);
-                        if ($link) echo '</a>';
-                    echo '</div>';
-                echo '</div>';
-            echo '</div>';
-        echo '</div>';
+        if (!$link) {
+            return $html;
+        }
+
+        return '<a href="' . $link . '" rel="sponsored noopener"' . ($label ? ' aria-label="' . esc_attr($label) . '"' : '') . '>' . $html . '</a>';
+    }
+
+    private function get_media_box($inner, $ratio, $kind, $attributes = '') {
+        $ratio = max(0.2, min(5, (float) $ratio));
+        $style = 'aspect-ratio:' . $this->css_number($ratio) . ';--ap-pad:' . $this->css_number(100 / $ratio) . '%';
+
+        return '<div class="ap-ad-media ap-ad-media--' . esc_attr($kind) . '" style="' . esc_attr($style) . '"' . $attributes . '>' . $inner . '</div>';
+    }
+
+    /**
+     * Proporcion ancho/alto de un anuncio de video o YouTube.
+     */
+    private function get_ad_ratio($ad) {
+        $type = isset($ad['type']) ? $ad['type'] : 'image';
+        $format = isset($ad['format']) ? $ad['format'] : $this->get_default_format($type);
+
+        if ('vertical' === $format) {
+            return 9 / 16;
+        }
+
+        if ('horizontal' === $format) {
+            return 16 / 9;
+        }
+
+        if ('auto' === $format) {
+            if ('youtube' === $type) {
+                $youtube = $this->parse_youtube(isset($ad['youtube_url']) ? $ad['youtube_url'] : '');
+                return $youtube['short'] ? 9 / 16 : 16 / 9;
+            }
+
+            $video_ratio = 'video' === $type && !empty($ad['video_id']) ? $this->get_video_ratio(absint($ad['video_id'])) : 0;
+            if ($video_ratio) {
+                return $video_ratio;
+            }
+        }
+
+        return $this->get_product_ratio();
+    }
+
+    private function get_video_ratio($video_id) {
+        $meta = wp_get_attachment_metadata($video_id);
+
+        if (is_array($meta) && !empty($meta['width']) && !empty($meta['height'])) {
+            return (int) $meta['width'] / (int) $meta['height'];
+        }
+
+        return 0;
+    }
+
+    /**
+     * Proporcion de las fotos de productos segun WooCommerce (1 si no se recortan).
+     */
+    private function get_product_ratio() {
+        if (function_exists('wc_get_image_size')) {
+            $size = wc_get_image_size('woocommerce_thumbnail');
+            $width = isset($size['width']) ? absint($size['width']) : 0;
+            $height = isset($size['height']) ? absint($size['height']) : 0;
+
+            if ($width && $height) {
+                return $width / $height;
+            }
+        }
+
+        return 1.0;
+    }
+
+    /**
+     * La miniatura hqdefault de YouTube es 4:3 y el video va centrado con bandas
+     * negras. Devuelve cuanto hay que ampliarla para que el video llene la caja.
+     */
+    private function get_youtube_thumb_scale($box_ratio, $video_ratio) {
+        $image_ratio = 4 / 3;
+        $frame_width = $video_ratio < $image_ratio ? $video_ratio / $image_ratio : 1;
+        $frame_height = $video_ratio < $image_ratio ? 1 : $image_ratio / $video_ratio;
+
+        if ($box_ratio > $image_ratio) {
+            $image_width = $box_ratio;
+            $image_height = $box_ratio / $image_ratio;
+        } else {
+            $image_width = $image_ratio;
+            $image_height = 1;
+        }
+
+        return max(1, $box_ratio / ($image_width * $frame_width), 1 / ($image_height * $frame_height));
+    }
+
+    private function css_number($number) {
+        return rtrim(rtrim(number_format((float) $number, 4, '.', ''), '0'), '.');
+    }
+
+    private function enqueue_front_script() {
+        wp_enqueue_script(
+            'ap-anuncio-front',
+            plugin_dir_url(AP_ANUNCIO_FLATSOME_FILE) . 'assets/front.js',
+            [],
+            AP_ANUNCIO_FLATSOME_VERSION,
+            true
+        );
     }
 
     private function get_ads_for_current_page() {
@@ -581,29 +862,22 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             return $ads;
         }
 
+        // Las casillas se quedan fijas; se mezcla el contenido (imagen, video,
+        // enlace, fechas...).
+        $placement_keys = ['row' => true, 'column' => true, 'position' => true];
         $placements = [];
         $creatives = [];
 
         foreach ($ads as $ad) {
-            $placements[] = [
-                'row' => isset($ad['row']) ? absint($ad['row']) : 1,
-                'column' => isset($ad['column']) ? absint($ad['column']) : $this->get_grid_columns(),
-                'position' => isset($ad['position']) ? absint($ad['position']) : $this->get_grid_columns(),
-            ];
-
-            $creatives[] = [
-                'image_id' => isset($ad['image_id']) ? absint($ad['image_id']) : 0,
-                'link' => isset($ad['link']) ? esc_url_raw($ad['link']) : '',
-                'start_date' => isset($ad['start_date']) ? $this->sanitize_ad_date($ad['start_date']) : '',
-                'end_date' => isset($ad['end_date']) ? $this->sanitize_ad_date($ad['end_date']) : '',
-            ];
+            $placements[] = array_intersect_key($ad, $placement_keys);
+            $creatives[] = array_diff_key($ad, $placement_keys);
         }
 
         shuffle($creatives);
 
         $randomized = [];
         foreach ($placements as $index => $placement) {
-            $randomized[] = array_merge($placement, $creatives[$index]);
+            $randomized[] = array_merge($creatives[$index], $placement);
         }
 
         return $randomized;
@@ -673,9 +947,83 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             }
 
             .ap-flatsome-ad .box-image,
-            .ap-flatsome-ad a {
+            .ap-flatsome-ad .box-image > a {
                 display: block;
                 width: 100%;
+            }
+
+            .ap-ad-media {
+                position: relative;
+                display: block;
+                width: 100%;
+                overflow: hidden;
+                border-radius: 6px;
+                background: #111;
+            }
+
+            @supports not (aspect-ratio: 1 / 1) {
+                .ap-ad-media::before {
+                    content: "";
+                    display: block;
+                    padding-top: var(--ap-pad, 100%);
+                }
+            }
+
+            .ap-ad-media > video,
+            .ap-ad-media > iframe,
+            .ap-ad-media .ap-ad-youtube__thumb {
+                position: absolute;
+                top: 0;
+                left: 0;
+                display: block;
+                width: 100%;
+                height: 100%;
+                max-width: none;
+                margin: 0;
+                border: 0;
+                object-fit: cover;
+            }
+
+            .ap-ad-youtube__play {
+                position: absolute;
+                top: 0;
+                left: 0;
+                display: block;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                cursor: pointer;
+            }
+
+            .ap-ad-youtube__icon {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: 68px;
+                height: 48px;
+                margin: -24px 0 0 -34px;
+                opacity: 0.9;
+                transition: opacity 0.2s ease, transform 0.2s ease;
+            }
+
+            .ap-ad-youtube__icon svg {
+                display: block;
+                width: 100%;
+                height: 100%;
+            }
+
+            .ap-ad-youtube__play:hover .ap-ad-youtube__icon,
+            .ap-ad-youtube__play:focus-visible .ap-ad-youtube__icon {
+                opacity: 1;
+                transform: scale(1.08);
+            }
+
+            .ap-flatsome-ad .ap-ad-cta-wrap {
+                padding: 10px 0 0;
+            }
+
+            .ap-flatsome-ad .ap-ad-cta {
+                margin: 0;
             }
 
             .ap-flatsome-ad-image {
@@ -736,6 +1084,11 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 <div class="ap-preview" role="group" aria-label="Vista previa de la grilla de productos"></div>
                 <p class="ap-preview-more" hidden></p>
                 <p class="ap-preview-help">Haz clic en un producto gris para poner un anuncio en su lugar, o en un anuncio para editarlo. En celular hay menos columnas, pero cada anuncio sigue apareciendo después del mismo producto.</p>
+
+                <div class="ap-add-menu" role="group" aria-label="Elegir qué poner en esta casilla" hidden>
+                    <span class="ap-add-menu__title">¿Qué quieres poner aquí?</span>
+                    <?php $this->render_type_buttons('ap-add-menu__item'); ?>
+                </div>
             </div>
 
             <div class="ap-ad-list">
@@ -746,22 +1099,57 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 ?>
             </div>
 
-            <p class="ap-empty"<?php echo $ads ? ' hidden' : ''; ?>>Todavía no hay anuncios. Usa el botón «Agregar anuncio» o haz clic en una casilla de la vista previa.</p>
+            <p class="ap-empty"<?php echo $ads ? ' hidden' : ''; ?>>Todavía no hay anuncios. Usa los botones de abajo o haz clic en una casilla de la vista previa.</p>
 
-            <p class="ap-add-wrap">
-                <button type="button" class="button ap-add-ad"><span class="dashicons dashicons-plus-alt2" aria-hidden="true"></span>Agregar anuncio</button>
-            </p>
+            <div class="ap-add-wrap">
+                <span class="ap-add-wrap__label">Agregar anuncio:</span>
+                <?php $this->render_type_buttons('ap-add-ad'); ?>
+            </div>
 
             <script type="text/html" class="ap-ad-template"><?php $this->render_ad_card($field_name, '__INDEX__', [], ''); ?></script>
         </div>
         <?php
     }
 
+    private function get_ad_type_labels() {
+        return [
+            'image' => ['label' => 'Imagen', 'icon' => 'dashicons-format-image'],
+            'video' => ['label' => 'Video', 'icon' => 'dashicons-video-alt3'],
+            'youtube' => ['label' => 'YouTube', 'icon' => 'dashicons-youtube'],
+        ];
+    }
+
+    private function render_type_buttons($class) {
+        foreach ($this->get_ad_type_labels() as $type => $info) {
+            printf(
+                '<button type="button" class="button %1$s" data-type="%2$s"><span class="dashicons %3$s" aria-hidden="true"></span>%4$s</button> ',
+                esc_attr($class),
+                esc_attr($type),
+                esc_attr($info['icon']),
+                esc_html($info['label'])
+            );
+        }
+    }
+
     private function render_ad_card($field_name, $index, $ad = [], $number = '') {
         $grid_columns = $this->get_grid_columns();
+        $type = (isset($ad['type']) && in_array($ad['type'], self::AD_TYPES, true)) ? $ad['type'] : 'image';
+
         $image_id = isset($ad['image_id']) ? absint($ad['image_id']) : 0;
         $image_url = $image_id ? wp_get_attachment_image_url($image_id, 'medium') : '';
         $image_missing = $image_id && !$image_url;
+
+        $video_id = isset($ad['video_id']) ? absint($ad['video_id']) : 0;
+        $video_url = $video_id ? wp_get_attachment_url($video_id) : '';
+        $video_missing = $video_id && !$video_url;
+        $video_mime = $video_url ? (string) get_post_mime_type($video_id) : '';
+        $video_size = $video_url ? $this->get_attachment_filesize($video_id) : 0;
+        $video_ratio = $video_url ? $this->get_video_ratio($video_id) : 0;
+
+        $youtube_url = isset($ad['youtube_url']) ? (string) $ad['youtube_url'] : '';
+        $has_format = isset($ad['format']) && in_array($ad['format'], self::AD_FORMATS, true);
+        $format = $has_format ? $ad['format'] : $this->get_default_format($type);
+        $button_text = isset($ad['button_text']) ? (string) $ad['button_text'] : '';
         $link = isset($ad['link']) ? (string) $ad['link'] : '';
         $position = isset($ad['position']) ? $this->sanitize_positive_int($ad['position']) : $grid_columns;
         $row = isset($ad['row']) ? $this->sanitize_positive_int($ad['row']) : max(1, (int) ceil($position / $grid_columns));
@@ -770,21 +1158,37 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         $start_date = isset($ad['start_date']) ? $this->sanitize_ad_date($ad['start_date']) : '';
         $end_date = isset($ad['end_date']) ? $this->sanitize_ad_date($ad['end_date']) : '';
         $name = $field_name . '[' . $index . ']';
+
+        $formats = [
+            'auto' => 'Original del video',
+            'product' => 'Como las fotos de productos',
+            'vertical' => 'Vertical 9:16',
+            'horizontal' => 'Horizontal 16:9',
+        ];
         ?>
-        <div class="ap-ad-card<?php echo $image_url ? ' has-image' : ''; ?>"<?php echo $image_missing ? ' data-image-missing="1"' : ''; ?>>
+        <div class="ap-ad-card ap-ad-card--<?php echo esc_attr($type); ?><?php echo ('image' === $type && $image_url) ? ' has-media' : ''; ?>"
+             data-image-url="<?php echo esc_url($image_url); ?>"
+             data-video-url="<?php echo esc_url($video_url); ?>"
+             data-video-mime="<?php echo esc_attr($video_mime); ?>"
+             data-video-size="<?php echo esc_attr($video_size); ?>"
+             data-video-ratio="<?php echo esc_attr($video_ratio ? $this->css_number($video_ratio) : ''); ?>"
+             data-format-touched="<?php echo ($has_format && 'image' !== $type) ? '1' : ''; ?>"<?php echo $image_missing ? ' data-image-missing="1"' : ''; ?><?php echo $video_missing ? ' data-video-missing="1"' : ''; ?>>
             <input type="hidden" class="ap-ad-image-id" name="<?php echo esc_attr($name); ?>[image_id]" value="<?php echo $image_url ? esc_attr($image_id) : ''; ?>">
+            <input type="hidden" class="ap-ad-video-id" name="<?php echo esc_attr($name); ?>[video_id]" value="<?php echo $video_url ? esc_attr($video_id) : ''; ?>">
 
             <div class="ap-ad-card__media">
-                <button type="button" class="ap-ad-card__picker ap-select-image" aria-label="Elegir o cambiar la imagen del anuncio">
-                    <img class="ap-ad-thumb" alt=""<?php echo $image_url ? ' src="' . esc_url($image_url) . '"' : ' hidden'; ?>>
-                    <span class="ap-ad-card__placeholder"<?php echo $image_url ? ' hidden' : ''; ?>>
+                <button type="button" class="ap-ad-card__picker ap-media-picker" aria-label="Elegir el contenido del anuncio">
+                    <img class="ap-media-img" alt=""<?php echo ('image' === $type && $image_url) ? ' src="' . esc_url($image_url) . '"' : ' hidden'; ?>>
+                    <video class="ap-media-video" muted loop playsinline preload="metadata" hidden></video>
+                    <span class="ap-media-play" aria-hidden="true" hidden><span class="dashicons dashicons-controls-play"></span></span>
+                    <span class="ap-ad-card__placeholder"<?php echo ('image' === $type && $image_url) ? ' hidden' : ''; ?>>
                         <span class="dashicons dashicons-format-image" aria-hidden="true"></span>
-                        Elegir imagen
+                        <span class="ap-placeholder-text">Elegir imagen</span>
                     </span>
                 </button>
                 <div class="ap-ad-card__media-actions">
-                    <button type="button" class="button-link ap-select-image">Cambiar</button>
-                    <button type="button" class="button-link ap-remove-image">Quitar</button>
+                    <button type="button" class="button-link ap-media-change">Cambiar</button>
+                    <button type="button" class="button-link ap-media-remove">Quitar</button>
                 </div>
             </div>
 
@@ -795,11 +1199,45 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                     <button type="button" class="button-link button-link-delete ap-remove-ad"><span class="dashicons dashicons-trash" aria-hidden="true"></span>Eliminar</button>
                 </div>
 
+                <div class="ap-type" role="radiogroup" aria-label="Tipo de anuncio">
+                    <?php foreach ($this->get_ad_type_labels() as $value => $info) : ?>
+                        <label class="ap-type__option<?php echo $type === $value ? ' is-selected' : ''; ?>">
+                            <input type="radio" class="ap-ad-type" name="<?php echo esc_attr($name); ?>[type]" value="<?php echo esc_attr($value); ?>" <?php checked($type, $value); ?>>
+                            <span class="dashicons <?php echo esc_attr($info['icon']); ?>" aria-hidden="true"></span><?php echo esc_html($info['label']); ?>
+                        </label>
+                    <?php endforeach; ?>
+                </div>
+                <p class="ap-type-help" data-ap-types="video"<?php echo 'video' === $type ? '' : ' hidden'; ?>>Se reproduce solo, sin sonido y en bucle cuando el cliente llega a esa parte de la página.</p>
+                <p class="ap-type-help" data-ap-types="youtube"<?php echo 'youtube' === $type ? '' : ' hidden'; ?>>Se muestra la miniatura con un botón de reproducir. El video de YouTube se carga solo cuando el cliente lo toca.</p>
+
                 <p class="ap-ad-card__note" hidden></p>
 
                 <div class="ap-fields">
+                    <label class="ap-field ap-field--wide" data-ap-types="youtube"<?php echo 'youtube' === $type ? '' : ' hidden'; ?>>
+                        <span class="ap-field__label">Enlace del Short o del video de YouTube</span>
+                        <input type="text"
+                               inputmode="url"
+                               autocomplete="off"
+                               class="ap-input ap-ad-youtube"
+                               name="<?php echo esc_attr($name); ?>[youtube_url]"
+                               value="<?php echo esc_attr($youtube_url); ?>"
+                               placeholder="Ej.: https://youtube.com/shorts/…">
+                    </label>
+
+                    <div class="ap-field ap-field--wide ap-cover" data-ap-types="video youtube"<?php echo 'image' === $type ? ' hidden' : ''; ?>>
+                        <span class="ap-field__label">Portada <em>(opcional)</em></span>
+                        <div class="ap-cover__row">
+                            <img class="ap-cover__thumb" alt=""<?php echo $image_url ? ' src="' . esc_url($image_url) . '"' : ' hidden'; ?>>
+                            <button type="button" class="button button-small ap-cover-select"><?php echo $image_url ? 'Cambiar' : 'Elegir imagen'; ?></button>
+                            <button type="button" class="button-link ap-cover-remove"<?php echo $image_url ? '' : ' hidden'; ?>>Quitar</button>
+                            <span class="ap-cover__help"
+                                  data-text-video="Se ve mientras el video carga."
+                                  data-text-youtube="Reemplaza la miniatura de YouTube."></span>
+                        </div>
+                    </div>
+
                     <label class="ap-field ap-field--wide">
-                        <span class="ap-field__label">Enlace al hacer clic <em>(opcional)</em></span>
+                        <span class="ap-field__label"><span class="ap-link-label" data-text-default="Enlace al hacer clic" data-text-youtube="Enlace del botón «Ver oferta»"><?php echo 'youtube' === $type ? 'Enlace del botón «Ver oferta»' : 'Enlace al hacer clic'; ?></span> <em>(opcional)</em></span>
                         <input type="text"
                                inputmode="url"
                                autocomplete="off"
@@ -807,6 +1245,25 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                                name="<?php echo esc_attr($name); ?>[link]"
                                value="<?php echo esc_attr($link); ?>"
                                placeholder="Ej.: https://tusitio.com/ofertas">
+                    </label>
+
+                    <label class="ap-field" data-ap-types="video youtube"<?php echo 'image' === $type ? ' hidden' : ''; ?>>
+                        <span class="ap-field__label">Forma</span>
+                        <select class="ap-input ap-ad-format" name="<?php echo esc_attr($name); ?>[format]">
+                            <?php foreach ($formats as $value => $label) : ?>
+                                <option value="<?php echo esc_attr($value); ?>" <?php selected($format, $value); ?>><?php echo esc_html($label); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </label>
+
+                    <label class="ap-field" data-ap-types="youtube"<?php echo 'youtube' === $type ? '' : ' hidden'; ?>>
+                        <span class="ap-field__label">Texto del botón</span>
+                        <input type="text"
+                               class="ap-input ap-ad-button-text"
+                               name="<?php echo esc_attr($name); ?>[button_text]"
+                               value="<?php echo esc_attr($button_text); ?>"
+                               maxlength="40"
+                               placeholder="Ver oferta">
                     </label>
 
                     <label class="ap-field">
@@ -853,6 +1310,35 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         <?php
     }
 
+    private function get_attachment_filesize($attachment_id) {
+        $meta = wp_get_attachment_metadata($attachment_id);
+
+        if (is_array($meta) && !empty($meta['filesize'])) {
+            return (int) $meta['filesize'];
+        }
+
+        $file = get_attached_file($attachment_id);
+
+        return ($file && file_exists($file)) ? (int) filesize($file) : 0;
+    }
+
+    /**
+     * Indica si el anuncio tiene algo que mostrar ahora mismo.
+     */
+    private function ad_has_media($ad) {
+        $type = isset($ad['type']) ? $ad['type'] : 'image';
+
+        if ('video' === $type) {
+            return !empty($ad['video_id']) && (bool) wp_get_attachment_url(absint($ad['video_id']));
+        }
+
+        if ('youtube' === $type) {
+            return !empty($ad['youtube_id']);
+        }
+
+        return !empty($ad['image_id']) && (bool) wp_get_attachment_image_url(absint($ad['image_id']), 'thumbnail');
+    }
+
     /* ---------------------------------------------------------------------
      * Administracion: categorias y marcas
      * ------------------------------------------------------------------- */
@@ -887,7 +1373,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         $global_skip_rows = $this->sanitize_rows_string(get_option('ap_ad_skip_rows', ''));
         $global_active = 0;
         foreach ($this->get_global_ads(false, true) as $global_ad) {
-            if (wp_get_attachment_image_url($global_ad['image_id'], 'thumbnail')) {
+            if ($this->ad_has_media($global_ad)) {
                 $global_active++;
             }
         }
@@ -903,8 +1389,8 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
 
         $options = [
             'global' => ['Usar los anuncios generales', 'Los mismos que en la tienda. ' . $global_text],
-            'custom' => ['Usar anuncios propios', 'Imágenes y casillas solo para ' . $noun . '.'],
-            'none' => ['No mostrar anuncios', 'En ' . $noun . ' no aparecerá ninguna imagen publicitaria.'],
+            'custom' => ['Usar anuncios propios', 'Imágenes, videos y casillas solo para ' . $noun . '.'],
+            'none' => ['No mostrar anuncios', 'En ' . $noun . ' no aparecerá ninguna imagen ni video publicitario.'],
         ];
         ?>
         <div class="ap-admin ap-term-box">
@@ -928,7 +1414,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             </p>
 
             <div class="ap-mode-panel" data-ap-modes="custom"<?php echo 'custom' === $mode ? '' : ' hidden'; ?>>
-                <p class="description ap-custom-help">Si no agregas anuncios con imagen, o si ninguno está vigente por sus fechas, se mostrarán los anuncios generales.</p>
+                <p class="description ap-custom-help">Si no agregas anuncios con imagen o video, o si ninguno está vigente por sus fechas, se mostrarán los anuncios generales.</p>
                 <?php $this->render_ads_editor('ap_cat_ad_items', $ads, $global_skip_rows); ?>
             </div>
 
@@ -1020,7 +1506,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
         wp_enqueue_script('ap-anuncio-admin', $assets_url . 'admin.js', ['jquery', 'media-editor'], AP_ANUNCIO_FLATSOME_VERSION, true);
         wp_add_inline_script(
             'ap-anuncio-admin',
-            'window.apAnuncioAdmin = ' . wp_json_encode(['today' => current_time('Y-m-d')]) . ';',
+            'window.apAnuncioAdmin = ' . wp_json_encode(['today' => current_time('Y-m-d'), 'productRatio' => round($this->get_product_ratio(), 4)]) . ';',
             'before'
         );
     }
@@ -1037,10 +1523,10 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             <?php settings_errors(); ?>
 
             <div class="ap-intro">
-                <p><strong>¿Cómo funciona?</strong> Cada anuncio es una imagen que ocupa el lugar de un producto dentro de la grilla de la tienda.</p>
+                <p><strong>¿Cómo funciona?</strong> Cada anuncio es una imagen, un video o un video de YouTube que ocupa el lugar de un producto dentro de la grilla de la tienda.</p>
                 <ol>
                     <li>Indica cuántos productos por fila muestra tu tienda en computadora.</li>
-                    <li>Agrega tus anuncios: elige la imagen, el enlace y la casilla. También puedes hacer clic directamente en la vista previa.</li>
+                    <li>Agrega tus anuncios: elige la imagen o el video, el enlace y la casilla. También puedes hacer clic directamente en la vista previa.</li>
                     <li>Si una categoría o marca necesita anuncios distintos, configúrala al editarla<?php echo $term_links ? ' desde ' . implode(' o ', $term_links) : ''; ?>.</li>
                 </ol>
             </div>
@@ -1096,9 +1582,9 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                             <input type="hidden" name="ap_ad_randomize_global" value="0">
                             <label>
                                 <input type="checkbox" name="ap_ad_randomize_global" value="1" <?php checked(1, $randomize_global); ?>>
-                                Mezclar las imágenes en cada visita
+                                Mezclar los anuncios en cada visita
                             </label>
-                            <p class="description">Las casillas no cambian: solo se reparte al azar qué imagen, con su enlace, aparece en cada una. Útil si tienes 2 anuncios o más.</p>
+                            <p class="description">Las casillas no cambian: solo se reparte al azar qué anuncio, con su enlace, aparece en cada una. Útil si tienes 2 anuncios o más.</p>
                         </div>
                     </div>
                 </div>
@@ -1226,7 +1712,7 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
                 $active = count($this->get_term_ads($term->term_id, true));
 
                 if (!$total) {
-                    $summary = 'Anuncios propios sin imágenes: se muestran los generales.';
+                    $summary = 'Anuncios propios sin imagen ni video: se muestran los generales.';
                 } elseif (!$active) {
                     $summary = sprintf('%s, ninguno vigente hoy: se muestran los generales.', $this->plural($total, 'anuncio propio', 'anuncios propios'));
                 } else {
@@ -1293,11 +1779,11 @@ class AP_Anuncio_Flatsome_Categorias_Marcas_Mejorado {
             $height = isset($size['height']) ? absint($size['height']) : 0;
 
             if ($width && $height) {
-                return sprintf('Consejo: usa imágenes con la misma proporción que las fotos de tus productos (%1$d × %2$d px, o más grandes en esa proporción) para que la grilla quede pareja.', $width, $height);
+                return sprintf('Consejo: usa imágenes con la misma proporción que las fotos de tus productos (%1$d × %2$d px, o más grandes en esa proporción) para que la grilla quede pareja. Los videos conviene que duren menos de 15 segundos y pesen menos de 5 MB.', $width, $height);
             }
         }
 
-        return 'Consejo: usa imágenes con la misma proporción que las fotos de tus productos para que la grilla quede pareja.';
+        return 'Consejo: usa imágenes con la misma proporción que las fotos de tus productos para que la grilla quede pareja. Los videos conviene que duren menos de 15 segundos y pesen menos de 5 MB.';
     }
 
     private function get_term_noun($taxonomy) {
